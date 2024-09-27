@@ -452,13 +452,11 @@ int mpi_direct() {
     string outputDir = "C:\\Users\\user\\Desktop\\output_images\\";
     fs::create_directories(outputDir); // Ensure the output directory exists
 
-
     // Get the number of processes and the rank of the process
     int world_size, world_rank;
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 
-    // Declare variables for the image
     Mat image, blurred;
 
     if (world_rank == 0) {
@@ -474,84 +472,81 @@ int mpi_direct() {
     }
 
     // Broadcast image dimensions to all processes
-    int width = image.cols;
-    int height = image.rows;
+    int width, height;
+    if (world_rank == 0) {
+        width = image.cols;
+        height = image.rows;
+    }
     MPI_Bcast(&width, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&height, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
     if (world_rank != 0) {
-        // Allocate space for the image on all other processes
         image = Mat(height, width, CV_32FC3);
     }
 
-    // Broadcast the image data to all processes
-    MPI_Bcast(image.ptr<float>(), width * height * 3, MPI_FLOAT, 0, MPI_COMM_WORLD);
+    // Calculate image diagonal
+    double diagonalSize = sqrt(width * width + height * height);
 
-    // Set the Gaussian blur parameters
-    float sigma = 1.0f;
-    int kernelRadius = 3;
+    // Calculate dynamic kernel size and sigma
+    int kernelRadius;
+    float sigma;
+    if (world_rank == 0) {
+        int kernelSize = max(3, min(40, (int)(diagonalSize * 0.01) | 1));
+        kernelRadius = (kernelSize - 1) / 2;
+        sigma = 0.3 * ((kernelSize - 1) * 0.5 - 0.5) + 0.8;
+        sigma = min(sigma, 10.0f);
+    }
+
+    // Broadcast sigma and kernelRadius
+    MPI_Bcast(&kernelRadius, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&sigma, 1, MPI_FLOAT, 0, MPI_COMM_WORLD);
+
+    // Generate Gaussian kernel on each process
     vector<vector<float>> kernel = generateGaussianKernel2D(sigma, kernelRadius);
 
-    // Divide the image processing among the processes
+    // Scatter image rows
     int rows_per_proc = height / world_size;
-    int extra_rows = height % world_size;  // Remaining rows to be handled by the last process
-    int start_row = world_rank * rows_per_proc + min(world_rank, extra_rows);
-    int end_row = start_row + rows_per_proc;
-    if (world_rank < extra_rows) {
-        end_row += 1;  // Processes 0 to (extra_rows-1) handle one extra row
+    int extra_rows = height % world_size;
+
+    vector<int> sendcounts(world_size), displs(world_size);
+    for (int i = 0; i < world_size; ++i) {
+        sendcounts[i] = ((height / world_size) + (i < extra_rows ? 1 : 0)) * width * 3;
+        displs[i] = (i == 0) ? 0 : displs[i - 1] + sendcounts[i - 1];
     }
 
-    Mat local_temp = image.rowRange(start_row, end_row).clone();
+    int local_row_count = (height / world_size) + (world_rank < extra_rows ? 1 : 0);
+    Mat local_temp = Mat::zeros(local_row_count, width, CV_32FC3);
+
+    MPI_Scatterv(image.ptr<float>(), sendcounts.data(), displs.data(), MPI_FLOAT,
+        local_temp.ptr<float>(), sendcounts[world_rank], MPI_FLOAT, 0, MPI_COMM_WORLD);
+
+    // Apply direct convolution on the local rows
     Mat local_blurred = Mat::zeros(local_temp.size(), CV_32FC3);
-
-    // Start timing
-    start_time_mpi = chrono::high_resolution_clock::now();
-
-    // Apply direct convolution for the local rows
+    auto start_time_mpi = chrono::high_resolution_clock::now();
     applyDirectConvolution(local_temp, local_blurred, kernel, kernelRadius);
+    auto end_time_mpi = chrono::high_resolution_clock::now();
 
-    int local_row_count = local_temp.rows;
-    vector<int> recvcounts(world_size);
-    vector<int> displs(world_size);
+    // Gather the results
+    MPI_Gatherv(local_blurred.ptr<float>(), sendcounts[world_rank], MPI_FLOAT,
+        image.ptr<float>(), sendcounts.data(), displs.data(), MPI_FLOAT, 0, MPI_COMM_WORLD);
 
-    // Root process calculates recvcounts and displacements for each process
+    // Timing and output
+    long long process_time_MPI_direct = chrono::duration_cast<chrono::milliseconds>(end_time_mpi - start_time_mpi).count();
     if (world_rank == 0) {
-        for (int i = 0; i < world_size; ++i) {
-            recvcounts[i] = ((height / world_size) + (i < extra_rows ? 1 : 0)) * width * 3;
-            displs[i] = (i == 0) ? 0 : displs[i - 1] + recvcounts[i - 1];
-        }
-    }
-
-    // Gather using MPI_Gatherv to account for variable-sized chunks
-    MPI_Gatherv(local_blurred.ptr<float>(), local_row_count * width * 3, MPI_FLOAT,
-        image.ptr<float>(), recvcounts.data(), displs.data(), MPI_FLOAT, 0, MPI_COMM_WORLD);
-
-    // Stop timing
-    end_time_mpi = chrono::high_resolution_clock::now();
-    process_time_MPI_direct = chrono::duration_cast<chrono::milliseconds>(end_time_mpi - start_time_mpi).count();
-
-    // On the root process, display the results
-    if (world_rank == 0) {
+        cout << "Image size: " << width << "x" << height << endl;
+        cout << "Sigma: " << sigma << ", Kernel size: " << 2 * kernelRadius + 1 << endl;
         cout << "Gaussian Blur with Direct Convolution took " << process_time_MPI_direct << " ms." << endl;
 
-        // Convert the blurred image back to 8-bit format
+        // Save and display results
         image.convertTo(blurred, CV_8UC3, 255.0);
-
-        // Display the original and blurred images
-        imshow("Original Image", imread(imagePath, IMREAD_COLOR));
-        imshow("Blurred Image", blurred);
-
-        // Save the blurred image if needed
-        fs::create_directories(outputDir); // Ensure the output directory exists
         string directOutputPath = outputDir + generateRandomFileName("_mpi_direct.jpg");
         imwrite(directOutputPath, blurred);
-        // Wait for a key press to close the images
     }
 
-    // Finalize the MPI environment
     MPI_Finalize();
     return 0;
 }
+
 //MPI SEPARABLE
 vector<float> generateGaussianKernel(float sigma, int kernelRadius) {
     int size = 2 * kernelRadius + 1;
@@ -613,104 +608,88 @@ int mpi_separable() {
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 
-    // Declare variables for the image
     Mat image, blurred;
 
     if (world_rank == 0) {
-        // Load the image on the root process
         image = imread(imagePath, IMREAD_COLOR);
         if (image.empty()) {
             cerr << "Could not open or find the image!" << endl;
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
-
-        // Convert the image to float type for processing
-        image.convertTo(image, CV_32F, 1.0 / 255.0); // Normalize to [0, 1]
+        image.convertTo(image, CV_32F, 1.0 / 255.0);
     }
 
-    // Broadcast image dimensions to all processes
-    int width = image.cols;
-    int height = image.rows;
+    int width, height;
+    if (world_rank == 0) {
+        width = image.cols;
+        height = image.rows;
+    }
     MPI_Bcast(&width, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&height, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
     if (world_rank != 0) {
-        // Allocate space for the image on all other processes
         image = Mat(height, width, CV_32FC3);
     }
 
-    // Broadcast the image data to all processes
-    MPI_Bcast(image.ptr<float>(), width * height * 3, MPI_FLOAT, 0, MPI_COMM_WORLD);
+    double diagonalSize = sqrt(width * width + height * height);
 
-    // Set the Gaussian blur parameters
-    float sigma = 1.0f;
-    int kernelRadius = 3;
+    int kernelRadius;
+    float sigma;
+    if (world_rank == 0) {
+        int kernelSize = max(3, min(40, (int)(diagonalSize * 0.01) | 1));
+        kernelRadius = (kernelSize - 1) / 2;
+        sigma = 0.3 * ((kernelSize - 1) * 0.5 - 0.5) + 0.8;
+        sigma = min(sigma, 10.0f);
+    }
+
+    MPI_Bcast(&kernelRadius, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&sigma, 1, MPI_FLOAT, 0, MPI_COMM_WORLD);
+
     vector<float> kernel = generateGaussianKernel(sigma, kernelRadius);
 
-    // Divide the image processing among the processes
     int rows_per_proc = height / world_size;
-    int extra_rows = height % world_size;  // Remaining rows to be handled by the last process
-    int start_row = world_rank * rows_per_proc + min(world_rank, extra_rows);
-    int end_row = start_row + rows_per_proc;
-    if (world_rank < extra_rows) {
-        end_row += 1;  // Processes 0 to (extra_rows-1) handle one extra row
+    int extra_rows = height % world_size;
+
+    vector<int> sendcounts(world_size), displs(world_size);
+    for (int i = 0; i < world_size; ++i) {
+        sendcounts[i] = ((height / world_size) + (i < extra_rows ? 1 : 0)) * width * 3;
+        displs[i] = (i == 0) ? 0 : displs[i - 1] + sendcounts[i - 1];
     }
 
-    Mat local_temp = image.rowRange(start_row, end_row).clone();
+    int local_row_count = (height / world_size) + (world_rank < extra_rows ? 1 : 0);
+    Mat local_temp = Mat::zeros(local_row_count, width, CV_32FC3);
+
+    MPI_Scatterv(image.ptr<float>(), sendcounts.data(), displs.data(), MPI_FLOAT,
+        local_temp.ptr<float>(), sendcounts[world_rank], MPI_FLOAT, 0, MPI_COMM_WORLD);
+
     Mat local_blurred = Mat::zeros(local_temp.size(), CV_32FC3);
 
-    // Start timing
-    start_time_mpi = chrono::high_resolution_clock::now();
+    auto start_time_mpi = chrono::high_resolution_clock::now();
 
-    // Horizontal pass for the local rows
+    // Horizontal and vertical passes
     horizontalPass(local_temp, local_blurred, kernel, kernelRadius);
-
-    // Vertical pass for the local rows
     verticalPass(local_blurred, local_temp, kernel, kernelRadius);
 
-    int local_row_count = local_temp.rows;
-    vector<int> recvcounts(world_size);
-    vector<int> displs(world_size);
+    auto end_time_mpi = chrono::high_resolution_clock::now();
 
-    // Root process calculates recvcounts and displacements for each process
+    MPI_Gatherv(local_temp.ptr<float>(), sendcounts[world_rank], MPI_FLOAT,
+        image.ptr<float>(), sendcounts.data(), displs.data(), MPI_FLOAT, 0, MPI_COMM_WORLD);
+
+    long long process_time_MPI_separable = chrono::duration_cast<chrono::milliseconds>(end_time_mpi - start_time_mpi).count();
     if (world_rank == 0) {
-        for (int i = 0; i < world_size; ++i) {
-            recvcounts[i] = ((height / world_size) + (i < extra_rows ? 1 : 0)) * width * 3;
-            displs[i] = (i == 0) ? 0 : displs[i - 1] + recvcounts[i - 1];
-        }
-    }
-
-    // Gather using MPI_Gatherv to account for variable-sized chunks
-    MPI_Gatherv(local_temp.ptr<float>(), local_row_count * width * 3, MPI_FLOAT,
-        image.ptr<float>(), recvcounts.data(), displs.data(), MPI_FLOAT, 0, MPI_COMM_WORLD);
-
-    // Stop timing
-    end_time_mpi = chrono::high_resolution_clock::now();
-    process_time_MPI_separable = chrono::duration_cast<chrono::milliseconds>(end_time_mpi - start_time_mpi).count();
-
-    // On the root process, display the results
-    if (world_rank == 0) {
+        cout << "Image size: " << width << "x" << height << endl;
+        cout << "Sigma: " << sigma << ", Kernel size: " << 2 * kernelRadius + 1 << endl;
         cout << "Gaussian Blur with Separable Convolution took " << process_time_MPI_separable << " ms." << endl;
 
-        // Convert the blurred image back to 8-bit format
         image.convertTo(blurred, CV_8UC3, 255.0);
-
-        // Display the original and blurred images
-        imshow("Original Image", imread(imagePath, IMREAD_COLOR));
-        imshow("Blurred Image", blurred);
-
-        // Save the blurred image if needed
-        fs::create_directories(outputDir); // Ensure the output directory exists
         string separableOutputPath = outputDir + generateRandomFileName("_mpi_separable.jpg");
         imwrite(separableOutputPath, blurred);
-
-        // Wait for a key press to close the images
     }
 
-    // Finalize the MPI environment
     MPI_Finalize();
     return 0;
 }
+
 
 /*-----------------------------------------------------------------------------MPI---------------------------------------------------------------------*/
 
